@@ -1,26 +1,14 @@
 '''
 etl_project_gdp: 나라별 GDP 리스트를 위키피디아에서 가져오기
 '''
-
 import logging
-import re
 import requests
 import pandas as pd
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 
 # 나라별 GDP 위키피디아 URL
 GDP_WIKI_URL = 'https://en.wikipedia.org/wiki/List_of_countries_by_GDP_%28nominal%29'
-
-# 대륙 이름과 위키피디아 내 대륙별 소속 나라 리스트가 포함된 챕터 id
-CONTINENT_COUNTRY_TABLE_URLS = [
-    ['Asia', 'States_of_Asia'],
-    ['North_America', 'Definitions'],
-    ['South_America', 'Countries_and_territories'],
-    ['Europe', 'List_of_states_and_territories'],
-    ['Africa', 'Territories_and_regions'],
-    ['Oceania', 'Demographics'],
-]
 
 
 def extract_gdp_table() -> pd.DataFrame:
@@ -61,58 +49,31 @@ def extract_gdp_table() -> pd.DataFrame:
             gdp = round(gdp, 2)
         gdp_list.append({'country': country, 'gdp': gdp})
 
-    return pd.DataFrame(gdp_list)
+    return pd.DataFrame(gdp_list).set_index('country')
 
 
-def extract_from_html_table(table_tag: Tag, continent: str) -> list[dict[str, str]]:
+def extract_region_table_from_csv(csvfile: str) -> pd.DataFrame:
     '''
-    파싱된 테이블에서 나라 리스트를 가져와 (나라, 대륙) 쌍 데이터를 가져오기
+    외부 csv 파일에서 region 테이블을 pd.DataFrame 형식으로 가져오기
     '''
-    output_list = []
-
-    tr_elements = table_tag.find_all('tr')
-
-    for tr in tr_elements:
-        row = tr.text.split('\n')
-        if row[1].strip() != '': # 테이블 내 그룹 표기(예: 동유럽, 서유럽, 북유럽)를 나타내는 행 제거
-            continue
-        country = re.sub(r'\[.+\]|\ ?\(.+\)|\*', r'', row[5]) # 첨자와 속령 표기 제거
-        output_list.append({'country': country, 'continent': continent})
-
-    return output_list
+    return pd.read_csv(csvfile, header=0).set_index('country')
 
 
-def extract_continent_country_table() -> pd.DataFrame:
+def refine_null_sort_gdp(df: pd.DataFrame) -> pd.DataFrame:
     '''
-    위키피디아에서 대륙별 나라 리스트를 가져와 pd.DataFrame 형에 모두 모아 가져오기
+    GDP 값이 NULL인 데이터 정제하고 GDP 기준으로 정렬
     '''
-    country_continent_pairs = []
+    df = df.dropna(subset=['gdp'])
+    df = df.sort_values('gdp', ascending=False)
 
-    for continent, section_id in CONTINENT_COUNTRY_TABLE_URLS:
-        wiki_url = 'https://en.wikipedia.org/wiki/' + continent # 대륙별 위키 페이지 주소
-        try:
-            req = requests.get(wiki_url, timeout=10)
-        except requests.exceptions.Timeout as e:
-            raise e
-        
-        soup = BeautifulSoup(req.text, 'html.parser')
+    return df
 
-        # 나라 리스트가 포함된 챕터에서 테이블 가져오기
-        table = soup.find(id=section_id).parent.find_next_sibling('table')
-        # 유럽의 경우, 나라 리스트는 두번째 테이블에 존재
-        if continent == 'Europe':
-            table = table.next_sibling.next_sibling
-        
-        pairs = extract_from_html_table(table, continent)
-        country_continent_pairs.extend(pairs)
 
-        # 아시아와 유럽은 UN이 인정하지 않은 국가 리스트가 별도로 존재
-        if continent in ['Asia', 'Europe']:
-            table = table.next_sibling.next_sibling.next_sibling.next_sibling
-            pairs = extract_from_html_table(table, continent)
-            country_continent_pairs.extend(pairs)
-        
-    return pd.DataFrame(country_continent_pairs)
+def transform_gdp_table_over_100b(df: pd.DataFrame) -> pd.DataFrame:
+    '''
+    GDP가 $100B 이상인 국가들을 내림차순으로 정렬
+    '''
+    return df[df['gdp'] >= 100].sort_values('gdp', ascending=False)
 
 
 def get_top5_mean(df: pd.DataFrame) -> float:
@@ -121,6 +82,19 @@ def get_top5_mean(df: pd.DataFrame) -> float:
     '''
     top5_gdp_s = df['gdp'].sort_values(ascending=False).head(5)
     return top5_gdp_s.mean()
+
+
+def transform_top_5_mean_gdp_by_region(gdp_df: pd.DataFrame,
+                                       region_df: pd.DataFrame
+                                       ) -> pd.DataFrame:
+    '''
+    대륙별로 GDP 상위 5개국의 평균을 계산
+    '''
+    top5_mean_s = gdp_df.join(region_df, on='country').groupby('region') \
+                                                      .apply(lambda x: round(get_top5_mean(x), 2),
+                                                             include_groups=False)
+    
+    return pd.DataFrame({'Top 5 mean GDP($Bilion)': top5_mean_s})
 
 
 def show_table(title: str, df: pd.DataFrame) -> None:
@@ -132,7 +106,7 @@ def show_table(title: str, df: pd.DataFrame) -> None:
     for column in df.columns:
         print(column, end='\t')
     print()
-    
+
     for index, row in df.iterrows():
         print(index, end='\t')
         print('\t'.join(map(str, row.values)))
@@ -156,32 +130,21 @@ def main() -> None:
     else:
         logging.info('Successfully extracted GDP table')
 
-    logging.info('Extracting Country-Continent table from wikipedia ...')
-    try:
-        country_continent_df = extract_continent_country_table()
-    except requests.exceptions.Timeout as e:
-        logging.error(e)
-        return
-    else:
-        logging.info('Successfully extracted Country-Continent table')
+    logging.info('Extracting Region table from csvfile ...')
+    region_df = extract_region_table_from_csv('region.csv')
+    logging.info('Successfully extracted Region table')
     # ----- Data Extraction ----- #
 
     # ----- Data Transformation ----- #
     logging.info('Transforming GDP table ...')
-    gdp_df.dropna(subset=['gdp'], inplace=True)
-    gdp_df.sort_values('gdp', ascending=False, inplace=True)
-    gdp_df.set_index('country', inplace=True)
-    show_table('GDP by countries more than $100B', gdp_df[gdp_df['gdp'] >= 100]) # $100B 이상만 출력
+    gdp_df = refine_null_sort_gdp(gdp_df)
+    show_table('GDP by countries more than $100B', 
+               transform_gdp_table_over_100b(gdp_df))
     logging.info('Successfully transformed GDP table')
 
-    logging.info('Transforming for Top 5 mean GDP by continents ...')
-    country_continent_df.set_index('country', inplace=True)
-    top5_mean_gdp_by_continent_df = gdp_df.join(country_continent_df, on='country') \
-                                          .groupby('continent') \
-                                          .apply(lambda x: round(get_top5_mean(x), 2), 
-                                                 include_groups=False)
-    show_table('Top 5 mean GDP by continents', 
-               pd.DataFrame({'Top 5 mean GDP': top5_mean_gdp_by_continent_df}))
+    logging.info('Transforming for Top 5 mean GDP by region ...')
+    show_table('Top 5 mean GDP by region',
+               transform_top_5_mean_gdp_by_region(gdp_df, region_df))
     logging.info('Successfully transformed Top 5 mean GDP table')
     # ----- Data Transformation ----- #
 
